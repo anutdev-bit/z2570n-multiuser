@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+# nubia — tiny helper for switching Android users over adb (no root needed on the phone,
+# but you do need an adb host: PC, laptop, or another device).
+#
+#   nubia status            device / current user / Shizuku state
+#   nubia users             list all users
+#   nubia switch <target>   switch user:  0|10|owner|user
+#   nubia start             start the Shizuku server through adb (then it survives unplugging)
+#   nubia kill              stop the Shizuku server (for testing)
+#   nubia usb [get|mtp]     read / set USB mode
+#   nubia sh '<command>'    raw adb shell
+#   nubia pull <path> [dst] pull a file
+#   nubia push <src> <dst>  push a file
+#   nubia shot [out.png]    screenshot
+#   nubia connect           find the phone over Wi-Fi and connect
+#   nubia help              this text
+set -u
+
+ADB=""
+pick_adb() {
+  local c
+  for c in "$(command -v adb 2>/dev/null)" "$HOME/.local/bin/adb" "$HOME/platform-tools/adb" \
+           "$HOME/Android/Sdk/platform-tools/adb" "$HOME/mibox/sdk/platform-tools/adb" \
+           /usr/bin/adb /usr/local/bin/adb; do
+    [ -n "$c" ] && [ -x "$c" ] && { ADB="$c"; return 0; }
+  done
+  ADB=adb
+}
+pick_adb
+
+DEV=""
+find_dev() {
+  local d t
+  d=$("$ADB" devices 2>/dev/null | awk '$2=="device"{print $1; exit}')
+  [ -n "$d" ] && { DEV="$d"; return 0; }
+
+  t=$("$ADB" mdns services 2>/dev/null | awk '/_adb-tls-connect/{print $NF; exit}')
+  if [ -n "$t" ]; then
+    "$ADB" connect "$t" >/dev/null 2>&1
+    sleep 2
+    d=$("$ADB" devices 2>/dev/null | awk '$2=="device"{print $1; exit}')
+    [ -n "$d" ] && { DEV="$d"; return 0; }
+  fi
+  return 1
+}
+
+need_dev() {
+  find_dev || {
+    echo "No device found."
+    echo "  - plug in USB and unlock the screen, or"
+    echo "  - enable Wireless debugging and try again"
+    exit 1
+  }
+}
+
+s() { "$ADB" -s "$DEV" shell "$@" 2>/dev/null | tr -d '\r'; }
+
+to_uid() {
+  case "${1:-}" in
+    owner|main|primary|0) echo 0 ;;
+    user|second|10)       echo 10 ;;
+    *[!0-9]*|"")          echo "" ;;
+    *)                    echo "$1" ;;
+  esac
+}
+
+cmd_status() {
+  need_dev || exit 1
+  local cur ps_out wifi
+  cur=$(s am get-current-user)
+  ps_out=$(s 'ps -A | grep shizuku_server' | head -1)
+  wifi=$(s 'settings get global adb_wifi_enabled')
+  echo "device   : $DEV"
+  echo "user     : $cur"
+  echo "shizuku  : ${ps_out:-not running}"
+  echo "wifi-adb : ${wifi:-?}"
+}
+
+cmd_users() {
+  need_dev || exit 1
+  echo "current user: $(s am get-current-user)"
+  echo
+  s 'pm list users'
+}
+
+cmd_switch() {
+  local uid cur later
+  uid=$(to_uid "${1:-}")
+  [ -z "$uid" ] && { echo "usage: nubia switch <0|10|owner|user>"; exit 1; }
+  need_dev || exit 1
+  cur=$(s am get-current-user)
+  if [ "$cur" = "$uid" ]; then echo "Already on user $uid."; return 0; fi
+  echo "Switching $cur -> $uid ..."
+  # adb usually drops here: the USB gadget resets during a user switch (see README)
+  "$ADB" -s "$DEV" shell "am switch-user $uid" >/dev/null 2>&1
+  echo "Command sent. A short USB/Wi-Fi drop is normal."
+  sleep 4
+  later=$("$ADB" shell am get-current-user 2>/dev/null | tr -d '\r')
+  if [ "$later" = "$uid" ]; then
+    echo "Confirmed: current user is $later"
+  else
+    echo "Channel did not come back yet — replug the cable or wait a few seconds."
+  fi
+}
+
+cmd_start() {
+  need_dev || exit 1
+  if s 'ps -A | grep -q shizuku_server'; then echo "Shizuku server already running."; cmd_status; return 0; fi
+  local base so
+  base=$(s 'pm path moe.shizuku.privileged.api' | sed 's/^package://' | head -1)
+  [ -z "$base" ] && { echo "Shizuku is not installed on the device."; exit 1; }
+  so="${base/base.apk/lib\/arm64\/libshizuku.so}"
+  echo "Starting Shizuku: $so"
+  s "nohup $so >/dev/null 2>&1 &"
+  sleep 2
+  cmd_status
+}
+
+cmd_kill() {
+  need_dev || exit 1
+  s 'kill $(pgrep -f shizuku_server)' >/dev/null
+  sleep 1
+  if s 'ps -A | grep -q shizuku_server'; then echo "Still running."; else echo "Shizuku server stopped."; fi
+}
+
+cmd_usb() {
+  need_dev || exit 1
+  case "${1:-get}" in
+    get) s 'svc usb getFunctions'; echo "state: $(s 'getprop sys.usb.state')" ;;
+    mtp) s 'svc usb setFunctions mtp'; sleep 1; echo "state: $(s 'getprop sys.usb.state')" ;;
+    *)   s "svc usb setFunctions $1" ;;
+  esac
+}
+
+cmd_sh()    { need_dev || exit 1; [ $# -eq 0 ] && { echo "usage: nubia sh '<command>'"; exit 1; }; s "$*"; }
+cmd_pull()  { need_dev || exit 1; [ $# -lt 1 ] && { echo "usage: nubia pull <device path> [local path]"; exit 1; }; "$ADB" -s "$DEV" pull "$@"; }
+cmd_push()  { need_dev || exit 1; [ $# -lt 2 ] && { echo "usage: nubia push <local file> <device path>"; exit 1; }; "$ADB" -s "$DEV" push "$@"; }
+
+cmd_shot() {
+  need_dev || exit 1
+  local out="${1:-/tmp/nubia-$(date +%H%M%S).png}"
+  "$ADB" -s "$DEV" exec-out screencap -p > "$out" && echo "saved: $out"
+}
+
+cmd_connect() { find_dev && echo "connected: $DEV" || echo "No device found."; }
+
+cmd_help() {
+  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+case "${1:-help}" in
+  status|st)        cmd_status ;;
+  users|list)       cmd_users ;;
+  switch|su|sw)     shift; cmd_switch "${1:-}" ;;
+  start|arm)        cmd_start ;;
+  kill|stop)        cmd_kill ;;
+  usb)              shift; cmd_usb "${1:-get}" ;;
+  sh|shell)         shift; cmd_sh "$@" ;;
+  pull)             shift; cmd_pull "$@" ;;
+  push)             shift; cmd_push "$@" ;;
+  shot|screenshot)  shift; cmd_shot "${1:-}" ;;
+  connect)          cmd_connect ;;
+  help|-h|--help)   cmd_help ;;
+  *)                echo "Unknown command: $1"; echo; cmd_help; exit 1 ;;
+esac
